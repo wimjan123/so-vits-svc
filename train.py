@@ -19,6 +19,7 @@ import torch.multiprocessing as mp
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.cuda.amp import autocast, GradScaler
+import torch_xla_py.xla_model as xm
 
 import modules.commons as commons
 import utils
