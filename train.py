@@ -17,12 +17,8 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import torch.multiprocessing as mp
 import torch.distributed as dist
-from torch_xla.distributed.data_parallel import DataParallel
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.cuda.amp import autocast, GradScaler
-import torch_xla
-import torch_xla.core.xla_model as xm
-import torch_xla.distributed.parallel_loader as pl
-import torch_xla.distributed.xla_multiprocessing as xmp
 
 import modules.commons as commons
 import utils
@@ -50,11 +46,11 @@ def main():
     assert torch.cuda.is_available(), "CPU training is not allowed."
     hps = utils.get_hparams()
 
-    n_gpus = xm.xrt_world_size()
+    n_gpus = torch.cuda.device_count()
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = hps.train.port
 
-    xmp.spawn(run, args=(n_gpus, hps,), nprocs=n_gpus, start_method='fork')
+    mp.spawn(run, nprocs=n_gpus, args=(n_gpus, hps,))
 
 
 def run(rank, n_gpus, hps):
@@ -69,12 +65,12 @@ def run(rank, n_gpus, hps):
     # for pytorch on win, backend use gloo    
     dist.init_process_group(backend=  'gloo' if os.name == 'nt' else 'nccl', init_method='env://', world_size=n_gpus, rank=rank)
     torch.manual_seed(hps.train.seed)
-    xm.set_device(xm.xla_device())  # Add this line
+    torch.cuda.set_device(rank)
     collate_fn = TextAudioCollate()
     train_dataset = TextAudioSpeakerLoader(hps.data.training_files, hps)
     num_workers = 5 if multiprocessing.cpu_count() > 4 else multiprocessing.cpu_count()
-    train_loader = pl.PerDeviceLoader(train_loader, xm.xla_device())
-
+    train_loader = DataLoader(train_dataset, num_workers=num_workers, shuffle=False, pin_memory=True,
+                              batch_size=hps.train.batch_size, collate_fn=collate_fn)
     if rank == 0:
         eval_dataset = TextAudioSpeakerLoader(hps.data.validation_files, hps)
         eval_loader = DataLoader(eval_dataset, num_workers=1, shuffle=False,
@@ -96,9 +92,8 @@ def run(rank, n_gpus, hps):
         hps.train.learning_rate,
         betas=hps.train.betas,
         eps=hps.train.eps)
-    net_g = DataParallel(net_g, device_ids=[rank])
-    net_d = DataParallel(net_d, device_ids=[rank])
-
+    net_g = DDP(net_g, device_ids=[rank])  # , find_unused_parameters=True)
+    net_d = DDP(net_d, device_ids=[rank])
 
     skip_optimizer = False
     try:
@@ -190,7 +185,7 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
         scaler.scale(loss_disc_all).backward()
         scaler.unscale_(optim_d)
         grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
-        xm.optimizer_step(optim_d)
+        scaler.step(optim_d)
 
         with autocast(enabled=hps.train.fp16_run):
             # Generator
@@ -206,7 +201,7 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
         scaler.scale(loss_gen_all).backward()
         scaler.unscale_(optim_g)
         grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
-        xm.optimizer_step(optim_g)
+        scaler.step(optim_g)
         scaler.update()
 
         if rank == 0:
